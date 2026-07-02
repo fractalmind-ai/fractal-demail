@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -346,6 +347,135 @@ func TestRunStopsOnContextCancel(t *testing.T) {
 	defer cancel()
 	if err := l.Run(ctx); err != context.DeadlineExceeded {
 		t.Fatalf("Run returned %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestCursorPersistedAndReloaded(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := mockRPC(t, sealedPayload(t, pub, "persist me"))
+	defer srv.Close()
+
+	cursorFile := t.TempDir() + "/cursor.json"
+	if err := os.WriteFile(cursorFile, []byte(`{"txDigest":"seed","eventSeq":"0"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	l, err := New(Config{
+		RPCURL:      srv.URL,
+		PackageID:   packageID,
+		Recipient:   recipientAddr,
+		IdentityKey: priv,
+		CursorFile:  cursorFile,
+	}, func(string, *schema.Plaintext) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.needsInit {
+		t.Fatal("valid cursor file must not trigger init-from-latest")
+	}
+	if string(l.cursor) != `{"txDigest":"seed","eventSeq":"0"}` {
+		t.Fatalf("cursor not loaded from file: %s", l.cursor)
+	}
+	if err := l.PollOnce(context.Background()); err != nil {
+		t.Fatalf("PollOnce: %v", err)
+	}
+	data, err := os.ReadFile(cursorFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !json.Valid(data) || string(data) == `{"txDigest":"seed","eventSeq":"0"}` {
+		t.Fatalf("cursor file not advanced after poll: %s", data)
+	}
+}
+
+func TestFreshCursorFileSkipsHistory(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := sealedPayload(t, pub, "historical")
+
+	var descendingCalls, ascendingCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string            `json:"method"`
+			ID     int               `json:"id"`
+			Params []json.RawMessage `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("bad rpc request: %v", err)
+		}
+		var result string
+		switch req.Method {
+		case "suix_queryEvents":
+			descending := len(req.Params) == 4 && string(req.Params[3]) == "true"
+			if descending {
+				descendingCalls++
+				// Newest historical event.
+				result = fmt.Sprintf(`{
+					"data": [{
+						"id": {"txDigest": "latest", "eventSeq": "7"},
+						"parsedJson": {
+							"message_id": %q, "sender": %q, "recipient": %q,
+							"payload_kind": %q, "created_at_ms": "1"
+						}
+					}],
+					"nextCursor": null, "hasNextPage": false
+				}`, messageID, senderAddr, recipientAddr,
+					base64.StdEncoding.EncodeToString([]byte("inline")))
+			} else {
+				ascendingCalls++
+				// Nothing new after the latest cursor.
+				result = `{"data": [], "nextCursor": null, "hasNextPage": false}`
+			}
+		case "sui_getObject":
+			result = fmt.Sprintf(`{"data": {"content": {"fields": {"payload": %q}}}}`, payload)
+		default:
+			t.Errorf("unexpected rpc method %s", req.Method)
+		}
+		fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":%s}`, req.ID, result)
+	}))
+	defer srv.Close()
+
+	called := false
+	cursorFile := t.TempDir() + "/cursor.json"
+	l, err := New(Config{
+		RPCURL:      srv.URL,
+		PackageID:   packageID,
+		Recipient:   recipientAddr,
+		IdentityKey: priv,
+		CursorFile:  cursorFile,
+	}, func(string, *schema.Plaintext) { called = true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	// First poll initializes from latest without delivering history.
+	if err := l.PollOnce(context.Background()); err != nil {
+		t.Fatalf("init poll: %v", err)
+	}
+	if called {
+		t.Fatal("history must not be replayed on fresh deployment")
+	}
+	if descendingCalls != 1 {
+		t.Fatalf("expected one descending init query, got %d", descendingCalls)
+	}
+	if string(l.cursor) != `{"txDigest": "latest", "eventSeq": "7"}` {
+		t.Fatalf("cursor not initialized from latest: %s", l.cursor)
+	}
+	// Second poll is a normal ascending query from that cursor.
+	if err := l.PollOnce(context.Background()); err != nil {
+		t.Fatalf("second poll: %v", err)
+	}
+	if called {
+		t.Fatal("no new events: handler must not fire")
+	}
+	if ascendingCalls != 1 {
+		t.Fatalf("expected one ascending query, got %d", ascendingCalls)
+	}
+	if data, err := os.ReadFile(cursorFile); err != nil || !json.Valid(data) {
+		t.Fatalf("cursor file not persisted: %v %s", err, data)
 	}
 }
 
