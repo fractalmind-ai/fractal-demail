@@ -93,17 +93,21 @@ func (r *Relay) Sponsor(ctx context.Context, unsignedTx []byte, senderSigner, sp
 		return RelayRequest{}, err
 	}
 
-	senderSig, err := senderSigner(ctx, unsignedTx)
+	// Copy before signing so neither signer (nor the caller, concurrently)
+	// can mutate the bytes between the two signatures — both signatures must
+	// cover the identical transaction.
+	tx := append([]byte(nil), unsignedTx...)
+	senderSig, err := senderSigner(ctx, tx)
 	if err != nil {
 		return RelayRequest{}, fmt.Errorf("sender sign: %w", err)
 	}
-	sponsorSig, err := sponsorSigner(ctx, unsignedTx)
+	sponsorSig, err := sponsorSigner(ctx, tx)
 	if err != nil {
 		return RelayRequest{}, fmt.Errorf("gas sponsor sign: %w", err)
 	}
 	return RelayRequest{
 		Route:            r.Route,
-		UnsignedTx:       append([]byte(nil), unsignedTx...),
+		UnsignedTx:       tx,
 		SenderSignature:  append([]byte(nil), senderSig...),
 		SponsorSignature: append([]byte(nil), sponsorSig...),
 	}, nil
@@ -118,15 +122,15 @@ func (r *Relay) Relay(ctx context.Context, req RelayRequest) error {
 	if err != nil {
 		return err
 	}
-	if req.Route != (Route{}) {
-		canonicalReqRoute, err := normalizeRoute(req.Route)
-		if err != nil {
-			return err
-		}
-		if canonicalReqRoute != canonicalRoute {
-			return fmt.Errorf("request route %q/%q does not match relay route %q/%q",
-				req.Route.Sender, req.Route.GasSponsor, r.Route.Sender, r.Route.GasSponsor)
-		}
+	// The request must carry its own route and it must match this relay —
+	// silently stamping an empty route would hide caller wiring bugs.
+	canonicalReqRoute, err := normalizeRoute(req.Route)
+	if err != nil {
+		return fmt.Errorf("request route: %w", err)
+	}
+	if canonicalReqRoute != canonicalRoute {
+		return fmt.Errorf("request route %q/%q does not match relay route %q/%q",
+			req.Route.Sender, req.Route.GasSponsor, r.Route.Sender, r.Route.GasSponsor)
 	}
 	req.Route = canonicalRoute
 	if len(req.UnsignedTx) == 0 {

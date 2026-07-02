@@ -10,6 +10,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -52,6 +53,9 @@ func New(cfg Config, handler Handler) (*Listener, error) {
 	if cfg.RPCURL == "" || cfg.PackageID == "" || cfg.Recipient == "" {
 		return nil, fmt.Errorf("RPCURL, PackageID and Recipient are required")
 	}
+	if _, err := decodeAddress(cfg.Recipient); err != nil {
+		return nil, fmt.Errorf("invalid Recipient: %w", err)
+	}
 	if len(cfg.IdentityKey) != ed25519.PrivateKeySize {
 		return nil, fmt.Errorf("IdentityKey must be a %d-byte ed25519 private key", ed25519.PrivateKeySize)
 	}
@@ -62,7 +66,8 @@ func New(cfg Config, handler Handler) (*Listener, error) {
 		cfg.PollInterval = 2 * time.Second
 	}
 	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = http.DefaultClient
+		// A hung connection must not stall the poll loop forever.
+		cfg.HTTPClient = &http.Client{Timeout: 15 * time.Second}
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -164,21 +169,37 @@ func (l *Listener) PollOnce(ctx context.Context) error {
 		var parsed messageSentEvent
 		if err := json.Unmarshal(ev.ParsedJSON, &parsed); err != nil {
 			l.cfg.Logger.Warn("demail: bad event json", "err", err)
+			l.cursor = ev.ID
 			continue
 		}
 		if !strings.EqualFold(parsed.Recipient, l.cfg.Recipient) {
+			l.cursor = ev.ID
 			continue
 		}
 		if err := l.process(ctx, &parsed); err != nil {
-			// Log and continue: one bad message must not block the stream.
+			// Transient transport failures (RPC/network) must NOT advance the
+			// cursor: the message is valid and will be retried next poll.
+			// Only genuine poison (bad envelope/key/schema) is skipped.
+			var te *transientError
+			if errors.As(err, &te) {
+				return fmt.Errorf("transient failure at message %s, will retry: %w", parsed.MessageID, err)
+			}
 			l.cfg.Logger.Warn("demail: message dropped", "message_id", parsed.MessageID, "err", err)
 		}
+		l.cursor = ev.ID
 	}
 	if res.NextCursor != nil && string(res.NextCursor) != "null" {
 		l.cursor = res.NextCursor
 	}
 	return nil
 }
+
+// transientError marks failures where the message itself is fine but the
+// fetch could not complete; these must be retried, never skipped.
+type transientError struct{ err error }
+
+func (e *transientError) Error() string { return e.err.Error() }
+func (e *transientError) Unwrap() error { return e.err }
 
 func (l *Listener) process(ctx context.Context, ev *messageSentEvent) error {
 	kind, err := decodeVectorU8(ev.PayloadKind)
@@ -236,7 +257,8 @@ func (l *Listener) fetchPayload(ctx context.Context, messageID string) ([]byte, 
 	var res getObjectResult
 	params := []any{messageID, map[string]any{"showContent": true}}
 	if err := l.call(ctx, "sui_getObject", params, &res); err != nil {
-		return nil, err
+		// RPC/network failure: the message may be perfectly valid.
+		return nil, &transientError{err}
 	}
 	if res.Data.Content.Fields.Payload == nil {
 		return nil, fmt.Errorf("message object %s has no payload (deleted?)", messageID)

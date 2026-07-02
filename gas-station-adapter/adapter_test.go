@@ -83,7 +83,16 @@ func TestRelayDelegatesToTransport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A request without its own route must be rejected, not silently stamped.
+	if err := relay.Relay(context.Background(), RelayRequest{
+		UnsignedTx:       []byte("tx"),
+		SenderSignature:  []byte("s1"),
+		SponsorSignature: []byte("s2"),
+	}); err == nil {
+		t.Fatal("expected rejection of request without route")
+	}
 	req := RelayRequest{
+		Route:            Route{Sender: testSender, GasSponsor: testGasSponsor},
 		UnsignedTx:       []byte("tx"),
 		SenderSignature:  []byte("s1"),
 		SponsorSignature: []byte("s2"),

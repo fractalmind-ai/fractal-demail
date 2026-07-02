@@ -212,6 +212,118 @@ func TestPollOnceIgnoresOtherRecipients(t *testing.T) {
 	}
 }
 
+func TestPollOnceRetriesMessageAfterTransientFetchError(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := sealedPayload(t, pub, "must not be lost")
+
+	failNext := true
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+			ID     int    `json:"id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("bad rpc request: %v", err)
+		}
+		var result string
+		switch req.Method {
+		case "suix_queryEvents":
+			result = fmt.Sprintf(`{
+				"data": [{
+					"id": {"txDigest": "abc", "eventSeq": "0"},
+					"parsedJson": {
+						"message_id": %q,
+						"sender": %q,
+						"recipient": %q,
+						"payload_kind": %q,
+						"created_at_ms": "1783011086750"
+					}
+				}],
+				"nextCursor": {"txDigest": "abc", "eventSeq": "0"},
+				"hasNextPage": false
+			}`, messageID, senderAddr, recipientAddr,
+				base64.StdEncoding.EncodeToString([]byte("inline")))
+		case "sui_getObject":
+			if failNext {
+				failNext = false
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			result = fmt.Sprintf(`{"data": {"content": {"fields": {"payload": %q}}}}`, payload)
+		default:
+			t.Errorf("unexpected rpc method %s", req.Method)
+		}
+		fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":%s}`, req.ID, result)
+	}))
+	defer srv.Close()
+
+	delivered := 0
+	l, err := New(Config{
+		RPCURL:      srv.URL,
+		PackageID:   packageID,
+		Recipient:   recipientAddr,
+		IdentityKey: priv,
+	}, func(_ string, msg *schema.Plaintext) {
+		if msg.Body == "must not be lost" {
+			delivered++
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// First poll: transient 500 on sui_getObject — must surface an error and
+	// must NOT advance the cursor past the valid message.
+	if err := l.PollOnce(context.Background()); err == nil {
+		t.Fatal("expected transient error from first poll")
+	}
+	if delivered != 0 {
+		t.Fatal("message must not be delivered while fetch fails")
+	}
+	if l.cursor != nil {
+		t.Fatalf("cursor must not advance past an unfetched message, got %s", l.cursor)
+	}
+	// Second poll: RPC healthy again — the same message must be delivered.
+	if err := l.PollOnce(context.Background()); err != nil {
+		t.Fatalf("second PollOnce: %v", err)
+	}
+	if delivered != 1 {
+		t.Fatalf("message lost after transient error: delivered=%d", delivered)
+	}
+}
+
+func TestPollOncePoisonMessageStillAdvancesCursor(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, otherPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Sealed to a different key: genuine poison for us, must be skipped.
+	srv := mockRPC(t, sealedPayload(t, pub, "poison"))
+	defer srv.Close()
+
+	l, err := New(Config{
+		RPCURL:      srv.URL,
+		PackageID:   packageID,
+		Recipient:   recipientAddr,
+		IdentityKey: otherPriv,
+	}, func(string, *schema.Plaintext) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.PollOnce(context.Background()); err != nil {
+		t.Fatalf("PollOnce: %v", err)
+	}
+	if l.cursor == nil {
+		t.Fatal("cursor must advance past genuine poison messages")
+	}
+}
+
 func TestRunStopsOnContextCancel(t *testing.T) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
