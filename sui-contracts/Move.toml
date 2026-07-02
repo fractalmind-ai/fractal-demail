@@ -4,5 +4,11 @@ edition = "2024.beta"
 license = "MIT"
 authors = ["fractalmind-ai"]
 
+[dependencies.Sui]
+git = "https://github.com/MystenLabs/sui.git"
+subdir = "crates/sui-framework/packages/sui-framework"
+# Framework rev matching sui CLI testnet-v1.67.1
+rev = "4e8aa9ee8b307b294cc85baf7d08af1f432e3d93"
+
 [addresses]
 fractal_demail = "0x0"

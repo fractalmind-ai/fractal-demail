@@ -5,14 +5,27 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  SUI_VERSION: testnet-v1.67.1
+
 jobs:
   move:
     name: Move build & test
     runs-on: ubuntu-latest
-    container: mysten/sui-tools:stable
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Sui CLI (${{ env.SUI_VERSION }})
+        run: |
+          set -euo pipefail
+          ARCHIVE="sui-${SUI_VERSION}-ubuntu-x86_64.tgz"
+          curl -fsSL "https://github.com/MystenLabs/sui/releases/download/${SUI_VERSION}/${ARCHIVE}" -o sui.tgz
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf sui.tgz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
       - name: sui move build
         run: sui move build --path sui-contracts
+
       - name: sui move test
         run: sui move test --path sui-contracts
