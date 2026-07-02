@@ -1,0 +1,8 @@
+[package]
+name = "fractal_demail"
+edition = "2024.beta"
+license = "MIT"
+authors = ["fractalmind-ai"]
+
+[addresses]
+fractal_demail = "0x0"

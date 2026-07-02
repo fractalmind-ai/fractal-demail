@@ -1,0 +1,18 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  move:
+    name: Move build & test
+    runs-on: ubuntu-latest
+    container: mysten/sui-tools:stable
+    steps:
+      - uses: actions/checkout@v4
+      - name: sui move build
+        run: sui move build --path sui-contracts
+      - name: sui move test
+        run: sui move test --path sui-contracts
