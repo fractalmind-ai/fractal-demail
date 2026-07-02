@@ -53,6 +53,17 @@ func TestParseStripsControlChars(t *testing.T) {
 	}
 }
 
+func TestParseNormalizesAddressCase(t *testing.T) {
+	mixed := strings.Replace(valid(), sender, "0x"+strings.ToUpper(sender[2:]), 1)
+	p, err := Parse([]byte(mixed), sender, recipient)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.From != sender {
+		t.Fatalf("address not normalized: %q", p.From)
+	}
+}
+
 func TestParseRejectsOversize(t *testing.T) {
 	big := strings.Replace(valid(), "do the thing", strings.Repeat("a", MaxPlaintextSize), 1)
 	if _, err := Parse([]byte(big), sender, recipient); err == nil {

@@ -36,16 +36,19 @@ var validTypes = map[string]bool{
 	TypeTask: true, TypeReply: true, TypeReceipt: true, TypeNotice: true,
 }
 
-func isSuiAddress(s string) bool {
+// normalizeSuiAddress lowercases a 0x-prefixed address so comparisons are
+// case-insensitive; returns "" if it is not a well-formed 32-byte address.
+func normalizeSuiAddress(s string) string {
+	s = strings.ToLower(s)
 	if !strings.HasPrefix(s, "0x") || len(s) != 66 {
-		return false
+		return ""
 	}
 	for _, r := range s[2:] {
 		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
-			return false
+			return ""
 		}
 	}
-	return true
+	return s
 }
 
 // stripControl removes control characters other than newline and tab.
@@ -75,13 +78,15 @@ func Parse(data []byte, onChainSender, onChainRecipient string) (*Plaintext, err
 	if !validTypes[p.Type] {
 		return nil, fmt.Errorf("invalid type %q", p.Type)
 	}
-	if !isSuiAddress(p.From) || !isSuiAddress(p.To) {
+	p.From = normalizeSuiAddress(p.From)
+	p.To = normalizeSuiAddress(p.To)
+	if p.From == "" || p.To == "" {
 		return nil, fmt.Errorf("invalid from/to address")
 	}
-	if p.From != onChainSender {
+	if p.From != normalizeSuiAddress(onChainSender) {
 		return nil, fmt.Errorf("from %s does not match on-chain sender %s", p.From, onChainSender)
 	}
-	if p.To != onChainRecipient {
+	if p.To != normalizeSuiAddress(onChainRecipient) {
 		return nil, fmt.Errorf("to %s does not match on-chain recipient %s", p.To, onChainRecipient)
 	}
 	if p.Body == "" {

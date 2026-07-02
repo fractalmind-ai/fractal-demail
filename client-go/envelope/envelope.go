@@ -138,9 +138,17 @@ func Open(recipientEdPriv ed25519.PrivateKey, senderAddr, recipientAddr []byte, 
 	if err != nil {
 		return nil, errors.New("invalid nonce encoding")
 	}
+	// chacha20poly1305.Open panics (rather than erroring) on a wrong-length
+	// nonce, and this is the untrusted inbound boundary — reject early.
+	if len(nonce) != chacha20poly1305.NonceSizeX {
+		return nil, fmt.Errorf("invalid nonce length %d", len(nonce))
+	}
 	ct, err := base64.StdEncoding.DecodeString(env.CT)
 	if err != nil {
 		return nil, errors.New("invalid ct encoding")
+	}
+	if len(ct) < chacha20poly1305.Overhead {
+		return nil, fmt.Errorf("ciphertext too short: %d", len(ct))
 	}
 	curve := ecdh.X25519()
 	recipientKey, err := curve.NewPrivateKey(Ed25519PrivateToX25519(recipientEdPriv))

@@ -76,6 +76,32 @@ func TestOpenRejectsWrongRecipientKey(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsMalformedNonceAndCT(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := Seal(pub, addr(0xAA), addr(0xBB), []byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Wrong-length nonces must return an error, never panic: the AEAD
+	// panics on bad nonce length and Open is the untrusted inbound path.
+	for _, nonce := range []string{"", "AAAA", "AAAAAAAAAAAAAAAA"} {
+		bad := *env
+		bad.Nonce = nonce
+		if _, err := Open(priv, addr(0xAA), addr(0xBB), &bad); err == nil {
+			t.Fatalf("expected error for malformed nonce %q", nonce)
+		}
+	}
+	// Ciphertext shorter than the Poly1305 tag must be rejected early.
+	bad := *env
+	bad.CT = "AAAA"
+	if _, err := Open(priv, addr(0xAA), addr(0xBB), &bad); err == nil {
+		t.Fatal("expected error for too-short ciphertext")
+	}
+}
+
 func TestOpenRejectsUnknownVersionAndAlg(t *testing.T) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
