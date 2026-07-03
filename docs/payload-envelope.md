@@ -8,7 +8,7 @@ Status: frozen for Phase 1 (2026-07-03). Governs the bytes carried in `Message.p
 
 | kind | `payload` contents | Use when |
 |------|--------------------|----------|
-| `inline` | The **base64 text** of the encrypted envelope JSON (§2) — CLI/PTB-safe. Readers MUST also accept raw envelope JSON (leading `{`) for compatibility with early senders | envelope ≤ 16 KiB (soft limit; hard cap is Sui object size) |
+| `inline` | The **standard-alphabet, padded base64** text (RFC 4648 §4 — Go `base64.StdEncoding`) of the encrypted envelope JSON (§2), CLI/PTB-safe. Readers MUST also accept raw envelope JSON (leading `{`) for compatibility with early senders. URL-safe (`-_`) or unpadded base64 is NOT accepted | envelope ≤ 16 KiB (soft limit; hard cap is Sui object size) |
 | `walrus` | UTF-8 Walrus blob id of the stored envelope, `:` , lowercase-hex SHA-256 of the envelope bytes | larger payloads; blob integrity is checked against the hash after fetch |
 
 Unknown kinds MUST be rejected by gateways (log + drop; never route).

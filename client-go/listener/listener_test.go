@@ -7,9 +7,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -522,3 +524,101 @@ func TestDecodeVectorU8NumberArray(t *testing.T) {
 		t.Fatal("expected out-of-range rejection")
 	}
 }
+
+func TestStuckCursorEscalatesOnceAndRecovers(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = pub
+	// Always-500 server: every poll fails as a transport error.
+	fail := true
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fail {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var req struct {
+			ID int `json:"id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"data":[],"nextCursor":null,"hasNextPage":false}}`, req.ID)
+	}))
+	defer srv.Close()
+
+	var errs, recovered int
+	lg := slog.New(slogHandlerFunc(func(level slog.Level, msg string) {
+		if level == slog.LevelError && strings.Contains(msg, "stuck") {
+			errs++
+		}
+		if level == slog.LevelInfo && strings.Contains(msg, "recovered") {
+			recovered++
+		}
+	}))
+	l, err := New(Config{
+		RPCURL:               srv.URL,
+		PackageID:            packageID,
+		Recipient:            recipientAddr,
+		IdentityKey:          priv,
+		StuckCursorThreshold: 3,
+		Logger:               lg,
+	}, func(string, *schema.Plaintext) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 5 failing polls: escalate exactly once at the threshold.
+	for i := 0; i < 5; i++ {
+		l.recordPoll(l.PollOnce(context.Background()))
+	}
+	if got := l.Stats().ConsecutivePollFailures; got != 5 {
+		t.Fatalf("ConsecutivePollFailures = %d, want 5", got)
+	}
+	if errs != 1 {
+		t.Fatalf("stuck escalations = %d, want exactly 1", errs)
+	}
+	// Recover: a healthy poll resets counters and logs recovery once.
+	fail = false
+	l.recordPoll(l.PollOnce(context.Background()))
+	if got := l.Stats().ConsecutivePollFailures; got != 0 {
+		t.Fatalf("after recovery ConsecutivePollFailures = %d, want 0", got)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovery logs = %d, want 1", recovered)
+	}
+	if l.Stats().TotalPollFailures != 5 {
+		t.Fatalf("TotalPollFailures = %d, want 5", l.Stats().TotalPollFailures)
+	}
+}
+
+func TestDecodeInlineRejectsURLSafeBase64(t *testing.T) {
+	// A URL-safe/unpadded base64 rendering of envelope JSON must NOT decode as
+	// canonical inline (spec pins StdEncoding); it falls through to poison.
+	env := []byte(`{"v":1,"alg":"x25519-xchacha20poly1305","epk":"","nonce":"","ct":""}`)
+	urlSafe := base64.RawURLEncoding.EncodeToString(env)
+	got := decodeInlinePayload([]byte(urlSafe))
+	// Not valid StdEncoding → returned as-is (the raw url-safe text), which is
+	// neither JSON nor a valid envelope → poison downstream.
+	if string(got) == string(env) {
+		t.Fatal("url-safe base64 must not be accepted as canonical inline")
+	}
+	// Standard padded base64 of the same bytes DOES decode.
+	std := base64.StdEncoding.EncodeToString(env)
+	if string(decodeInlinePayload([]byte(std))) != string(env) {
+		t.Fatal("standard padded base64 must decode to envelope JSON")
+	}
+	// Raw JSON passes through untouched.
+	if string(decodeInlinePayload(env)) != string(env) {
+		t.Fatal("raw JSON must pass through")
+	}
+}
+
+// slogHandlerFunc is a minimal slog.Handler capturing level+message.
+type slogHandlerFunc func(slog.Level, string)
+
+func (f slogHandlerFunc) Enabled(context.Context, slog.Level) bool { return true }
+func (f slogHandlerFunc) Handle(_ context.Context, r slog.Record) error {
+	f(r.Level, r.Message)
+	return nil
+}
+func (f slogHandlerFunc) WithAttrs([]slog.Attr) slog.Handler { return f }
+func (f slogHandlerFunc) WithGroup(string) slog.Handler      { return f }
