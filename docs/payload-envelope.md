@@ -55,3 +55,12 @@ What `client-go` hands to downstream routing (agent-manager-skill):
 ## 4. Versioning
 
 Envelope evolution bumps `v` (breaking) or adds optional JSON fields (non-breaking). `payload_kind` evolution adds new kinds; existing kinds are never repurposed. Contract changes are not required for either axis — this is the reason payload interpretation lives entirely off-chain.
+
+## Multi-tenant routing (Phase 2)
+
+The inbound bridge is multi-tenant: each organization owns an email domain and
+its own config (bridge Sui identity, agents, allowlist, rate limits). One
+provider account/webhook is shared, so the webhook is verified once and then
+the message is routed to the org owning the recipient's domain (`MultiOrgRelayer`).
+Cross-tenant isolation is enforced by each org's own allowlist and rate limiter;
+an unknown domain is dropped (`no_org`) before any token or gas is spent.

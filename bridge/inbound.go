@@ -118,6 +118,7 @@ const (
 	DropNoRecipient DropReason = "no_recipient" // unknown localpart
 	DropMalformed   DropReason = "malformed"    // unparseable email fields
 	DropSendFailed  DropReason = "send_failed"  // chain mint failed
+	DropNoOrg       DropReason = "no_org"       // recipient domain has no org
 )
 
 // RelayResult is the outcome of one webhook.
@@ -133,6 +134,13 @@ func (r *InboundRelayer) Handle(ctx context.Context, headers map[string]string, 
 	if err != nil {
 		return RelayResult{Drop: DropUnverified}, fmt.Errorf("verify: %w", err)
 	}
+	return r.deliver(ctx, email)
+}
+
+// deliver runs the post-verification pipeline for an already-authenticated
+// email. Shared with the multi-org router, which verifies once and then
+// dispatches to the org owning the recipient domain.
+func (r *InboundRelayer) deliver(ctx context.Context, email *InboundEmail) (RelayResult, error) {
 	from := normalizeEmail(email.From)
 	if from == "" {
 		return RelayResult{Drop: DropMalformed}, fmt.Errorf("malformed sender %q", email.From)
@@ -212,6 +220,16 @@ func recipientLocalpart(addr string) string {
 		return ""
 	}
 	return addr[:strings.IndexByte(addr, '@')]
+}
+
+// emailDomain returns the lowercased domain of an email address, or "" if the
+// address is malformed.
+func emailDomain(addr string) string {
+	addr = normalizeEmail(addr)
+	if addr == "" {
+		return ""
+	}
+	return addr[strings.IndexByte(addr, '@')+1:]
 }
 
 // hexAddress validates and decodes a 0x Sui address to 32 raw bytes.
