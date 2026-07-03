@@ -72,14 +72,28 @@ func TestWebhookServerSendFailedReturns502(t *testing.T) {
 	}
 }
 
-func TestWebhookServerDroppedReturns200NoRetry(t *testing.T) {
-	for _, d := range []DropReason{DropNotAllowed, DropRateLimited, DropNoRecipient, DropNoOrg, DropMalformed} {
+func TestWebhookServerPermanentDropsReturn200NoRetry(t *testing.T) {
+	for _, d := range []DropReason{DropNotAllowed, DropNoRecipient, DropNoOrg, DropMalformed} {
 		sr := &stubRelayer{res: RelayResult{Drop: d}}
 		h := NewWebhookServer(sr, 0, nil).Handler()
 		rec := doPost(t, h, `{}`, nil)
 		if rec.Code != http.StatusOK {
-			t.Fatalf("drop %s status = %d, want 200 (no provider retry)", d, rec.Code)
+			t.Fatalf("permanent drop %s status = %d, want 200 (no provider retry)", d, rec.Code)
 		}
+	}
+}
+
+func TestWebhookServerRateLimitedReturns429Retriable(t *testing.T) {
+	// A token-bucket rate-limit is transient: the provider must retry so a
+	// legitimate email that arrived a moment too soon is deferred, not dropped.
+	sr := &stubRelayer{res: RelayResult{Drop: DropRateLimited}}
+	h := NewWebhookServer(sr, 0, nil).Handler()
+	rec := doPost(t, h, `{}`, nil)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("rate_limited status = %d, want 429 (retriable)", rec.Code)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Fatal("429 must carry a Retry-After header")
 	}
 }
 

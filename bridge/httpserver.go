@@ -15,6 +15,12 @@ type inboundHandler interface {
 	Handle(ctx context.Context, headers map[string]string, body []byte) (RelayResult, error)
 }
 
+// Compile-time proof the production relayers satisfy the server's dependency.
+var (
+	_ inboundHandler = (*MultiOrgRelayer)(nil)
+	_ inboundHandler = (*InboundRelayer)(nil)
+)
+
 // WebhookServer exposes an inbound relayer as an HTTP endpoint for a provider
 // (Resend) to POST verified webhooks to. It maps relay outcomes to status
 // codes without leaking internals, caps the request body, and never logs
@@ -48,18 +54,24 @@ func (s *WebhookServer) Handler() http.Handler {
 	return mux
 }
 
-// dropStatus maps a drop reason to an HTTP status. 4xx tells the provider not
-// to retry (bad/unauth request); 5xx invites a retry (transient chain/send).
+// dropStatus maps a drop reason to an HTTP status so the provider retries
+// exactly the failures that could later succeed.
 func dropStatus(d DropReason) int {
 	switch d {
 	case DropUnverified:
 		return http.StatusUnauthorized
 	case DropSendFailed:
-		return http.StatusBadGateway // transient: provider may retry
+		return http.StatusBadGateway // transient chain/send: provider retries
+	case DropRateLimited:
+		// The limiter is a token bucket (a rate throttle, not a permanent
+		// policy or a total quota), and only allowlisted+verified senders
+		// reach it. "Too fast right now" — the same message retried after the
+		// bucket refills WOULD succeed, so ask the provider to retry instead
+		// of silently dropping a legitimate email.
+		return http.StatusTooManyRequests
 	default:
-		// not_allowed / rate_limited / no_recipient / no_org / malformed:
-		// accepted-but-not-actioned; 200 so the provider doesn't retry a
-		// request that will never succeed.
+		// not_allowed / no_recipient / no_org / malformed: these will never
+		// succeed on retry, so 200 stops the provider from retrying.
 		return http.StatusOK
 	}
 }
@@ -96,6 +108,9 @@ func (s *WebhookServer) handleInbound(w http.ResponseWriter, r *http.Request) {
 		s.logger.Info("demail inbound relayed", "tx", res.TxDigest)
 	} else {
 		status = dropStatus(res.Drop)
+		if status == http.StatusTooManyRequests {
+			w.Header().Set("Retry-After", "60")
+		}
 		// Log the reason only, never the payload/sender.
 		s.logger.Warn("demail inbound dropped", "reason", string(res.Drop), "err_present", err != nil)
 	}
