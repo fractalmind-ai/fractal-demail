@@ -144,6 +144,120 @@ type TransportFunc func(context.Context, RelayRequest) error
 
 func (f TransportFunc) Relay(ctx context.Context, req RelayRequest) error { return f(ctx, req) }
 
+func TestRouteSelfSponsored(t *testing.T) {
+	tests := []struct {
+		name  string
+		route Route
+		want  bool
+	}{
+		{"same address", Route{Sender: testSender, GasSponsor: testSender}, true},
+		{"same address different case and spacing", Route{Sender: strings.ToUpper(testSender), GasSponsor: "  " + testSender + "  "}, true},
+		{"distinct addresses", Route{Sender: testSender, GasSponsor: testGasSponsor}, false},
+		{"malformed route", Route{Sender: "0x123", GasSponsor: "0x123"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.route.SelfSponsored(); got != tt.want {
+				t.Fatalf("SelfSponsored() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSponsorSelfSponsoredSingleSignature(t *testing.T) {
+	relay, err := New(Route{Sender: testSender, GasSponsor: strings.ToUpper(testSender)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	senderCalls := 0
+	req, err := relay.Sponsor(context.Background(), []byte("unsigned"), func(context.Context, []byte) ([]byte, error) {
+		senderCalls++
+		return []byte("sender-sig"), nil
+	}, func(context.Context, []byte) ([]byte, error) {
+		t.Fatal("sponsorSigner must not be called on a self-sponsored route")
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if senderCalls != 1 {
+		t.Fatalf("sender signer calls = %d, want 1", senderCalls)
+	}
+	if !bytes.Equal(req.SenderSignature, []byte("sender-sig")) {
+		t.Fatalf("sender sig = %q", req.SenderSignature)
+	}
+	if len(req.SponsorSignature) != 0 {
+		t.Fatalf("sponsor sig = %q, want empty", req.SponsorSignature)
+	}
+}
+
+func TestSponsorSelfSponsoredAllowsNilSponsorSigner(t *testing.T) {
+	relay, err := New(Route{Sender: testSender, GasSponsor: testSender}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := relay.Sponsor(context.Background(), []byte("unsigned"), func(context.Context, []byte) ([]byte, error) {
+		return []byte("sender-sig"), nil
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(req.SponsorSignature) != 0 {
+		t.Fatalf("sponsor sig = %q, want empty", req.SponsorSignature)
+	}
+}
+
+func TestSponsorDistinctRouteStillRequiresSponsorSigner(t *testing.T) {
+	relay, err := New(Route{Sender: testSender, GasSponsor: testGasSponsor}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := relay.Sponsor(context.Background(), []byte("unsigned"), func(context.Context, []byte) ([]byte, error) {
+		return []byte("sender-sig"), nil
+	}, nil); err == nil {
+		t.Fatal("expected error for missing sponsor signer on distinct route")
+	}
+}
+
+func TestRelaySignatureRules(t *testing.T) {
+	tests := []struct {
+		name       string
+		route      Route
+		senderSig  []byte
+		sponsorSig []byte
+		wantErr    bool
+	}{
+		{"self-sponsored single sig accepted", Route{Sender: testSender, GasSponsor: testSender}, []byte("s1"), nil, false},
+		{"self-sponsored case-insensitive route accepted", Route{Sender: strings.ToUpper(testSender), GasSponsor: testSender}, []byte("s1"), nil, false},
+		{"self-sponsored double sig rejected", Route{Sender: testSender, GasSponsor: testSender}, []byte("s1"), []byte("s2"), true},
+		{"self-sponsored missing sender sig rejected", Route{Sender: testSender, GasSponsor: testSender}, nil, nil, true},
+		{"distinct route both sigs accepted", Route{Sender: testSender, GasSponsor: testGasSponsor}, []byte("s1"), []byte("s2"), false},
+		{"distinct route missing sponsor sig rejected", Route{Sender: testSender, GasSponsor: testGasSponsor}, []byte("s1"), nil, true},
+		{"distinct route missing sender sig rejected", Route{Sender: testSender, GasSponsor: testGasSponsor}, nil, []byte("s2"), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			relay, err := New(tt.route, TransportFunc(func(context.Context, RelayRequest) error { return nil }))
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = relay.Relay(context.Background(), RelayRequest{
+				Route:            tt.route,
+				UnsignedTx:       []byte("tx"),
+				SenderSignature:  tt.senderSig,
+				SponsorSignature: tt.sponsorSig,
+			})
+			if tt.wantErr && err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestSponsorPropagatesSignerError(t *testing.T) {
 	relay, err := New(Route{Sender: testSender, GasSponsor: testGasSponsor}, nil)
 	if err != nil {
