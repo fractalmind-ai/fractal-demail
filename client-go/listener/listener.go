@@ -282,7 +282,7 @@ func (l *Listener) process(ctx context.Context, ev *messageSentEvent) error {
 	var envBytes []byte
 	switch string(kind) {
 	case "inline":
-		envBytes = payload
+		envBytes = decodeInlinePayload(payload)
 	case "walrus":
 		return fmt.Errorf("walrus payloads not supported yet")
 	default:
@@ -333,6 +333,22 @@ func (l *Listener) fetchPayload(ctx context.Context, messageID string) ([]byte, 
 		return nil, fmt.Errorf("message object %s has no payload (deleted?)", messageID)
 	}
 	return decodeVectorU8(res.Data.Content.Fields.Payload)
+}
+
+// decodeInlinePayload returns the envelope JSON bytes for an inline payload.
+// Canonical on-chain encoding (per docs/payload-envelope.md) is the base64
+// text of the envelope JSON — CLI-safe for PTB string arguments. Raw JSON
+// payloads (leading '{') are accepted for compatibility with early senders.
+func decodeInlinePayload(payload []byte) []byte {
+	if len(payload) > 0 && payload[0] == '{' {
+		return payload
+	}
+	if decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(payload))); err == nil {
+		return decoded
+	}
+	// Neither JSON nor base64: hand through and let envelope.Unmarshal
+	// produce the poison-message error.
+	return payload
 }
 
 // decodeVectorU8 accepts the two renderings Sui RPC uses for vector<u8>:

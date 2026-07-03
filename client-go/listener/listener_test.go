@@ -479,6 +479,37 @@ func TestFreshCursorFileSkipsHistory(t *testing.T) {
 	}
 }
 
+func TestPollOnceAcceptsBase64TextInlinePayload(t *testing.T) {
+	// Canonical on-chain inline encoding: the Message.payload bytes are the
+	// base64 TEXT of the envelope JSON (what a CLI/PTB sender writes). The
+	// object RPC then renders those bytes base64-encoded once more.
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envB64Text := sealedPayload(t, pub, "cli-sender-payload") // base64 of envelope JSON
+	doubleEncoded := base64.StdEncoding.EncodeToString([]byte(envB64Text))
+	srv := mockRPC(t, doubleEncoded)
+	defer srv.Close()
+
+	got := ""
+	l, err := New(Config{
+		RPCURL:      srv.URL,
+		PackageID:   packageID,
+		Recipient:   recipientAddr,
+		IdentityKey: priv,
+	}, func(_ string, msg *schema.Plaintext) { got = msg.Body })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.PollOnce(context.Background()); err != nil {
+		t.Fatalf("PollOnce: %v", err)
+	}
+	if got != "cli-sender-payload" {
+		t.Fatalf("base64-text inline payload not delivered, got %q", got)
+	}
+}
+
 func TestDecodeVectorU8NumberArray(t *testing.T) {
 	got, err := decodeVectorU8(json.RawMessage(`[104,105]`))
 	if err != nil {
