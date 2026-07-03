@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -36,17 +37,25 @@ type Config struct {
 	IdentityKey ed25519.PrivateKey
 	// PollInterval defaults to 2s.
 	PollInterval time.Duration
-	// HTTPClient defaults to http.DefaultClient.
+	// HTTPClient defaults to a client with a 15s timeout.
 	HTTPClient *http.Client
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
+	// CursorFile persists the poll cursor across restarts. Without it the
+	// cursor is memory-only and a restart would replay all history through
+	// the handler; with it, only messages since the last processed event
+	// are (re)delivered. On the very first run (no file, no cursor) the
+	// listener initializes from the newest existing event and does NOT
+	// replay history.
+	CursorFile string
 }
 
 // Listener polls suix_queryEvents with a cursor and processes new events.
 type Listener struct {
-	cfg     Config
-	handler Handler
-	cursor  json.RawMessage
+	cfg       Config
+	handler   Handler
+	cursor    json.RawMessage
+	needsInit bool
 }
 
 func New(cfg Config, handler Handler) (*Listener, error) {
@@ -72,7 +81,63 @@ func New(cfg Config, handler Handler) (*Listener, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Listener{cfg: cfg, handler: handler}, nil
+	l := &Listener{cfg: cfg, handler: handler}
+	if cfg.CursorFile != "" {
+		data, err := os.ReadFile(cfg.CursorFile)
+		switch {
+		case err == nil && json.Valid(data) && string(data) != "null":
+			l.cursor = json.RawMessage(data)
+		case err == nil:
+			// Corrupt/empty checkpoint: safer to skip history than replay it.
+			l.needsInit = true
+		case os.IsNotExist(err):
+			// Fresh deployment: position at the newest event, do not replay
+			// history through the handler.
+			l.needsInit = true
+		default:
+			return nil, fmt.Errorf("read cursor file: %w", err)
+		}
+	}
+	return l, nil
+}
+
+// setCursor advances the cursor and best-effort persists it. Persistence
+// failures are logged, not fatal: losing a checkpoint means re-delivery,
+// which downstream must tolerate anyway.
+func (l *Listener) setCursor(cursor json.RawMessage) {
+	if cursor == nil || string(cursor) == "null" {
+		return
+	}
+	l.cursor = cursor
+	if l.cfg.CursorFile == "" {
+		return
+	}
+	tmp := l.cfg.CursorFile + ".tmp"
+	if err := os.WriteFile(tmp, cursor, 0o600); err != nil {
+		l.cfg.Logger.Warn("demail: persist cursor", "err", err)
+		return
+	}
+	if err := os.Rename(tmp, l.cfg.CursorFile); err != nil {
+		l.cfg.Logger.Warn("demail: persist cursor", "err", err)
+	}
+}
+
+// initCursorFromLatest positions a brand-new listener at the newest existing
+// event so history is not replayed through the handler.
+func (l *Listener) initCursorFromLatest(ctx context.Context) error {
+	filter := map[string]any{
+		"MoveEventType": l.cfg.PackageID + "::demail::MessageSent",
+	}
+	var res queryEventsResult
+	// descending_order=true: first page starts at the newest event.
+	if err := l.call(ctx, "suix_queryEvents", []any{filter, nil, 1, true}, &res); err != nil {
+		return err
+	}
+	if len(res.Data) > 0 {
+		l.setCursor(res.Data[0].ID)
+	}
+	l.needsInit = false
+	return nil
 }
 
 // Run polls until ctx is cancelled. Poll errors are logged and retried on the
@@ -154,6 +219,12 @@ type queryEventsResult struct {
 
 // PollOnce fetches and processes one page of new events.
 func (l *Listener) PollOnce(ctx context.Context) error {
+	if l.needsInit {
+		if err := l.initCursorFromLatest(ctx); err != nil {
+			return fmt.Errorf("init cursor from latest: %w", err)
+		}
+		return nil
+	}
 	filter := map[string]any{
 		"MoveEventType": l.cfg.PackageID + "::demail::MessageSent",
 	}
@@ -169,11 +240,11 @@ func (l *Listener) PollOnce(ctx context.Context) error {
 		var parsed messageSentEvent
 		if err := json.Unmarshal(ev.ParsedJSON, &parsed); err != nil {
 			l.cfg.Logger.Warn("demail: bad event json", "err", err)
-			l.cursor = ev.ID
+			l.setCursor(ev.ID)
 			continue
 		}
 		if !strings.EqualFold(parsed.Recipient, l.cfg.Recipient) {
-			l.cursor = ev.ID
+			l.setCursor(ev.ID)
 			continue
 		}
 		if err := l.process(ctx, &parsed); err != nil {
@@ -186,11 +257,9 @@ func (l *Listener) PollOnce(ctx context.Context) error {
 			}
 			l.cfg.Logger.Warn("demail: message dropped", "message_id", parsed.MessageID, "err", err)
 		}
-		l.cursor = ev.ID
+		l.setCursor(ev.ID)
 	}
-	if res.NextCursor != nil && string(res.NextCursor) != "null" {
-		l.cursor = res.NextCursor
-	}
+	l.setCursor(res.NextCursor)
 	return nil
 }
 
