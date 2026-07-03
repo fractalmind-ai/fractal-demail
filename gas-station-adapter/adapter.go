@@ -5,6 +5,12 @@
 // route (`--sender` + `--gas-sponsor`), collects both signatures over the same
 // unsigned transaction bytes, and hands the sealed request to a transport.
 //
+// Self-sponsored routes (sender == gas sponsor) are a single-signature
+// special case: Sui expects exactly one signature when the sender pays its
+// own gas, so Sponsor collects only the sender signature and Relay enforces
+// that the sponsor signature stays empty. Transports must submit only the
+// non-empty signatures on a request.
+//
 // It does not talk to a real sponsor provider yet; the transport is an
 // interface so a Testnet pool / provider client can be wired in later without
 // changing the Phase 1 contract.
@@ -43,6 +49,17 @@ func (r Route) Validate() error {
 	return nil
 }
 
+// SelfSponsored reports whether the canonical sender and canonical gas
+// sponsor are the same address, i.e. the sender pays its own gas. A route
+// that fails canonicalization is never self-sponsored.
+func (r Route) SelfSponsored() bool {
+	canonical, err := normalizeRoute(r)
+	if err != nil {
+		return false
+	}
+	return canonical.Sender == canonical.GasSponsor
+}
+
 // CLIArgs returns the minimal verified flag set used by the dual-sign flow.
 func (r Route) CLIArgs() ([]string, error) {
 	sender, err := canonicalAddress(r.Sender)
@@ -57,6 +74,13 @@ func (r Route) CLIArgs() ([]string, error) {
 }
 
 // RelayRequest is the sealed outbound sponsorship envelope.
+//
+// SenderSignature is always present. SponsorSignature is present exactly
+// when the route is NOT self-sponsored: on a self-sponsored route
+// (Route.SelfSponsored() == true) Sui expects a single signature, so
+// SponsorSignature is nil/empty. Transports must submit only the non-empty
+// signatures and can use SponsorSignature emptiness (or Route.SelfSponsored)
+// to distinguish the two modes.
 type RelayRequest struct {
 	Route            Route
 	UnsignedTx       []byte
@@ -78,7 +102,12 @@ func New(route Route, transport Transport) (*Relay, error) {
 	return &Relay{Route: route, Transport: transport}, nil
 }
 
-// Sponsor collects both signatures over the same transaction bytes.
+// Sponsor collects the signatures over the same transaction bytes.
+//
+// On a distinct-address route it collects both signatures and both signers
+// are required. On a self-sponsored route Sui expects exactly one signature,
+// so only senderSigner is called and the sponsorSigner may be nil; the
+// returned request carries an empty SponsorSignature.
 func (r *Relay) Sponsor(ctx context.Context, unsignedTx []byte, senderSigner, sponsorSigner Signer) (RelayRequest, error) {
 	if r == nil {
 		return RelayRequest{}, errors.New("relay is nil")
@@ -86,11 +115,15 @@ func (r *Relay) Sponsor(ctx context.Context, unsignedTx []byte, senderSigner, sp
 	if len(unsignedTx) == 0 {
 		return RelayRequest{}, errors.New("unsigned tx is required")
 	}
-	if senderSigner == nil || sponsorSigner == nil {
-		return RelayRequest{}, errors.New("both senderSigner and sponsorSigner are required")
-	}
 	if err := r.Route.Validate(); err != nil {
 		return RelayRequest{}, err
+	}
+	selfSponsored := r.Route.SelfSponsored()
+	if senderSigner == nil {
+		return RelayRequest{}, errors.New("senderSigner is required")
+	}
+	if sponsorSigner == nil && !selfSponsored {
+		return RelayRequest{}, errors.New("sponsorSigner is required for a distinct gas sponsor")
 	}
 
 	// Copy before signing so neither signer (nor the caller, concurrently)
@@ -100,6 +133,15 @@ func (r *Relay) Sponsor(ctx context.Context, unsignedTx []byte, senderSigner, sp
 	senderSig, err := senderSigner(ctx, tx)
 	if err != nil {
 		return RelayRequest{}, fmt.Errorf("sender sign: %w", err)
+	}
+	if selfSponsored {
+		// Single-signature mode: the sender signature is the only signature
+		// Sui accepts, so sponsorSigner is never called even when non-nil.
+		return RelayRequest{
+			Route:           r.Route,
+			UnsignedTx:      tx,
+			SenderSignature: append([]byte(nil), senderSig...),
+		}, nil
 	}
 	sponsorSig, err := sponsorSigner(ctx, tx)
 	if err != nil {
@@ -139,7 +181,14 @@ func (r *Relay) Relay(ctx context.Context, req RelayRequest) error {
 	if len(req.SenderSignature) == 0 {
 		return errors.New("sender signature is required")
 	}
-	if len(req.SponsorSignature) == 0 {
+	if canonicalRoute.Sender == canonicalRoute.GasSponsor {
+		// Self-sponsored: Sui expects exactly one signature. A sponsor
+		// signature here is ambiguous — fail loudly instead of letting a
+		// transport submit two signatures and get rejected on-chain.
+		if len(req.SponsorSignature) != 0 {
+			return errors.New("gas sponsor signature must be empty on a self-sponsored route")
+		}
+	} else if len(req.SponsorSignature) == 0 {
 		return errors.New("gas sponsor signature is required")
 	}
 	if r.Transport == nil {
