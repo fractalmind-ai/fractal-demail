@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/fractalmind-ai/fractal-demail/client-go/schema"
 )
@@ -81,10 +82,26 @@ func (w *OutboundWatcher) Handle(ctx context.Context, msg *schema.Plaintext) (Ou
 	if !w.cfg.Limiter.Allow(to) {
 		return OutboundResult{Drop: DropRateLimited}, nil
 	}
-	// schema.Parse already stripped control chars from Web2To (CRLF header
-	// injection) and Body; deliver as plaintext.
-	if err := w.smtp.Send(ctx, to, msg.Subject, msg.Body); err != nil {
+	// Sanitize Subject at the SMTP seam. schema.Parse keeps \n and \t in
+	// Subject/Body (only addr fields get full stripping), so Subject can carry
+	// a bare LF — an email-header injection vector once it reaches a header.
+	// The watcher is the last Web2-side gate, so it strips ALL control chars
+	// from Subject here rather than trusting upstream. Body stays as-is (it is
+	// a message body, not a header).
+	subject := stripAllControl(msg.Subject)
+	if err := w.smtp.Send(ctx, to, subject, msg.Body); err != nil {
 		return OutboundResult{Drop: DropDeliverFailed}, fmt.Errorf("smtp send: %w", err)
 	}
 	return OutboundResult{Delivered: true}, nil
+}
+
+// stripAllControl removes every control character (incl. CR/LF/TAB) so a value
+// cannot inject email headers downstream.
+func stripAllControl(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, s)
 }

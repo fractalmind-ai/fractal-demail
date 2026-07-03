@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/fractalmind-ai/fractal-demail/client-go/schema"
@@ -127,5 +128,23 @@ func TestOutboundNilMessage(t *testing.T) {
 func TestNewOutboundWatcherRequiresSMTP(t *testing.T) {
 	if _, err := NewOutboundWatcher(OutboundConfig{}, nil); err == nil {
 		t.Fatal("expected nil smtp rejection")
+	}
+}
+
+func TestOutboundSubjectStripsHeaderInjection(t *testing.T) {
+	s := &mockSMTP{}
+	w := newWatcher(t, s, nil)
+	m := reply("owner@gmail.com", "body")
+	// schema.Parse would keep the bare LF in Subject; the watcher must strip it.
+	m.Subject = "hi\r\nBcc: victim@x.com\nX-Injected: 1\ttab"
+	res, err := w.Handle(context.Background(), m)
+	if err != nil || !res.Delivered {
+		t.Fatalf("expected delivery, got %+v err=%v", res, err)
+	}
+	if strings.ContainsAny(s.subject, "\r\n\t") {
+		t.Fatalf("subject retained control chars (header injection): %q", s.subject)
+	}
+	if s.subject != "hiBcc: victim@x.comX-Injected: 1tab" {
+		t.Fatalf("unexpected sanitized subject: %q", s.subject)
 	}
 }
