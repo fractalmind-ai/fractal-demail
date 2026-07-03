@@ -17,6 +17,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fractalmind-ai/fractal-demail/client-go/envelope"
@@ -41,6 +42,10 @@ type Config struct {
 	HTTPClient *http.Client
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
+	// StuckCursorThreshold is the number of consecutive PollOnce failures
+	// before Run escalates a stuck-cursor error (inbound mail not advancing).
+	// Defaults to 5.
+	StuckCursorThreshold int
 	// CursorFile persists the poll cursor across restarts. Without it the
 	// cursor is memory-only and a restart would replay all history through
 	// the handler; with it, only messages since the last processed event
@@ -56,6 +61,10 @@ type Listener struct {
 	handler   Handler
 	cursor    json.RawMessage
 	needsInit bool
+
+	statsMu   sync.Mutex
+	stats     Stats
+	escalated bool
 }
 
 func New(cfg Config, handler Handler) (*Listener, error) {
@@ -80,6 +89,9 @@ func New(cfg Config, handler Handler) (*Listener, error) {
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	if cfg.StuckCursorThreshold <= 0 {
+		cfg.StuckCursorThreshold = 5
 	}
 	l := &Listener{cfg: cfg, handler: handler}
 	if cfg.CursorFile != "" {
@@ -140,14 +152,39 @@ func (l *Listener) initCursorFromLatest(ctx context.Context) error {
 	return nil
 }
 
+// Stats is a point-in-time snapshot of listener health, for monitoring.
+type Stats struct {
+	// ConsecutivePollFailures counts PollOnce errors since the last success.
+	// A rising value means the cursor is stuck (transient RPC outage or a
+	// persistently failing fetch): inbound mail is not advancing.
+	ConsecutivePollFailures int
+	// TotalPollFailures is the lifetime count of PollOnce errors.
+	TotalPollFailures uint64
+	// LastPollErr is the most recent PollOnce error (nil after a success).
+	LastPollErr error
+}
+
+// Stats returns a snapshot of listener health. Safe to call from another
+// goroutine while Run is executing.
+func (l *Listener) Stats() Stats {
+	l.statsMu.Lock()
+	defer l.statsMu.Unlock()
+	return l.stats
+}
+
 // Run polls until ctx is cancelled. Poll errors are logged and retried on the
-// next tick; they never stop the loop.
+// next tick; they never stop the loop. A stuck cursor (consecutive poll
+// failures past StuckCursorThreshold) is escalated to Error level once so a
+// monitor/alert can fire; Stats() exposes the counters for scraping.
 func (l *Listener) Run(ctx context.Context) error {
 	ticker := time.NewTicker(l.cfg.PollInterval)
 	defer ticker.Stop()
 	for {
-		if err := l.PollOnce(ctx); err != nil {
-			l.cfg.Logger.Warn("demail poll failed", "err", err)
+		err := l.PollOnce(ctx)
+		consecutive := l.recordPoll(err)
+		if err != nil {
+			l.cfg.Logger.Warn("demail poll failed", "err", err,
+				"consecutive_failures", consecutive)
 		}
 		select {
 		case <-ctx.Done():
@@ -155,6 +192,33 @@ func (l *Listener) Run(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+// recordPoll updates health counters, escalates a stuck cursor exactly once
+// per stuck episode, and returns the current consecutive-failure count.
+func (l *Listener) recordPoll(err error) int {
+	l.statsMu.Lock()
+	defer l.statsMu.Unlock()
+	if err == nil {
+		if l.escalated {
+			l.cfg.Logger.Info("demail: cursor recovered",
+				"after_failures", l.stats.ConsecutivePollFailures)
+		}
+		l.stats.ConsecutivePollFailures = 0
+		l.stats.LastPollErr = nil
+		l.escalated = false
+		return 0
+	}
+	l.stats.ConsecutivePollFailures++
+	l.stats.TotalPollFailures++
+	l.stats.LastPollErr = err
+	if !l.escalated && l.stats.ConsecutivePollFailures >= l.cfg.StuckCursorThreshold {
+		l.escalated = true
+		l.cfg.Logger.Error("demail: cursor appears stuck; inbound mail is not advancing",
+			"consecutive_failures", l.stats.ConsecutivePollFailures,
+			"threshold", l.cfg.StuckCursorThreshold, "err", err)
+	}
+	return l.stats.ConsecutivePollFailures
 }
 
 type rpcRequest struct {
@@ -336,9 +400,11 @@ func (l *Listener) fetchPayload(ctx context.Context, messageID string) ([]byte, 
 }
 
 // decodeInlinePayload returns the envelope JSON bytes for an inline payload.
-// Canonical on-chain encoding (per docs/payload-envelope.md) is the base64
-// text of the envelope JSON — CLI-safe for PTB string arguments. Raw JSON
-// payloads (leading '{') are accepted for compatibility with early senders.
+// Canonical on-chain encoding (per docs/payload-envelope.md) is standard-
+// alphabet, padded base64 (base64.StdEncoding) of the envelope JSON — CLI-safe
+// for PTB string arguments. Raw JSON payloads (leading '{') are accepted for
+// compatibility with early senders. URL-safe/unpadded base64 is not a valid
+// StdEncoding string and falls through to fail as poison, as specified.
 func decodeInlinePayload(payload []byte) []byte {
 	if len(payload) > 0 && payload[0] == '{' {
 		return payload
