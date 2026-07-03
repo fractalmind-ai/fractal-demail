@@ -193,3 +193,36 @@ func TestInboundEmptyBodyRejectedBeforeMint(t *testing.T) {
 		t.Fatalf("empty body must drop before mint, got %+v err=%v calls=%d", res, err, s.calls)
 	}
 }
+
+func TestInboundMixedCaseAgentKeyNormalized(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	al, _ := NewAllowlist([]string{"owner@gmail.com"})
+	r, err := NewInboundRelayer(InboundConfig{
+		BridgeAddress: bridgeAddr,
+		Agents:        map[string]Agent{"Agent": {SuiAddress: agentAddr, PubKey: pub}},
+		Allowlist:     al,
+		Now:           func() time.Time { return time.UnixMilli(1783000000000) },
+	}, mockVerifier{email: &InboundEmail{From: "owner@gmail.com", To: "AGENT@mail.example.com", Body: "hi"}}, &mockSender{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = priv
+	res, err := r.Handle(context.Background(), nil, nil)
+	if err != nil || !res.Delivered {
+		t.Fatalf("mixed-case agent key must match lowercased localpart, got %+v err=%v", res, err)
+	}
+}
+
+func TestInboundDuplicateAgentKeyRejected(t *testing.T) {
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	_, err := NewInboundRelayer(InboundConfig{
+		BridgeAddress: bridgeAddr,
+		Agents: map[string]Agent{
+			"Agent": {SuiAddress: agentAddr, PubKey: pub},
+			"agent": {SuiAddress: agentAddr, PubKey: pub},
+		},
+	}, mockVerifier{}, &mockSender{})
+	if err == nil {
+		t.Fatal("expected duplicate-after-normalization rejection")
+	}
+}

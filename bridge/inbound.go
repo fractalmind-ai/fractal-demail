@@ -83,6 +83,10 @@ func NewInboundRelayer(cfg InboundConfig, verifier WebhookVerifier, sender Chain
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	// Recipient localparts are matched case-insensitively (lowercased), so
+	// normalize the map keys here — a mixed-case config key would otherwise
+	// silently 404 every message.
+	agents := make(map[string]Agent, len(cfg.Agents))
 	for lp, ag := range cfg.Agents {
 		if _, err := hexAddress(ag.SuiAddress); err != nil {
 			return nil, fmt.Errorf("agent %q address: %w", lp, err)
@@ -90,7 +94,16 @@ func NewInboundRelayer(cfg InboundConfig, verifier WebhookVerifier, sender Chain
 		if len(ag.PubKey) != ed25519.PublicKeySize {
 			return nil, fmt.Errorf("agent %q pubkey must be %d bytes", lp, ed25519.PublicKeySize)
 		}
+		key := strings.ToLower(strings.TrimSpace(lp))
+		if key == "" {
+			return nil, fmt.Errorf("agent localpart must not be blank")
+		}
+		if _, dup := agents[key]; dup {
+			return nil, fmt.Errorf("agent localpart %q duplicated after normalization", key)
+		}
+		agents[key] = ag
 	}
+	cfg.Agents = agents
 	return &InboundRelayer{cfg: cfg, verifier: verifier, sender: sender}, nil
 }
 
