@@ -30,6 +30,14 @@ type Plaintext struct {
 	Body    string `json:"body"`
 	ReplyTo string `json:"reply_to,omitempty"`
 	TS      int64  `json:"ts"`
+	// Web2From carries the originating Web2 email address when a message was
+	// relayed in by the bridge (on-chain From is the bridge's Sui identity, so
+	// this preserves provenance). Optional; empty for pure on-chain mail.
+	Web2From string `json:"web2_from,omitempty"`
+	// Web2To names the Web2 email recipient for a message the agent wants the
+	// bridge to deliver out over SMTP (on-chain To is the bridge address).
+	// Optional; empty for pure on-chain mail.
+	Web2To string `json:"web2_to,omitempty"`
 }
 
 var validTypes = map[string]bool{
@@ -97,5 +105,31 @@ func Parse(data []byte, onChainSender, onChainRecipient string) (*Plaintext, err
 	}
 	p.Subject = stripControl(p.Subject)
 	p.Body = stripControl(p.Body)
+	// Bridge provenance fields are email addresses from an untrusted source.
+	// Strip ALL control characters including CR/LF/TAB — unlike Subject/Body,
+	// these may reach an SMTP client, where CR/LF is the header-injection
+	// vector. Length-cap to the RFC 5321 maximum.
+	p.Web2From = capString(stripEmailControl(p.Web2From), maxWeb2AddrLen)
+	p.Web2To = capString(stripEmailControl(p.Web2To), maxWeb2AddrLen)
 	return &p, nil
+}
+
+const maxWeb2AddrLen = 320 // RFC 5321 max email address length
+
+// stripEmailControl removes every control character (no newline/tab exception)
+// so a value cannot inject SMTP headers downstream.
+func stripEmailControl(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+func capString(s string, max int) string {
+	if len(s) > max {
+		return s[:max]
+	}
+	return s
 }
