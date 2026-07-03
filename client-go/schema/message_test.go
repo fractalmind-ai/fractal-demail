@@ -70,3 +70,33 @@ func TestParseRejectsOversize(t *testing.T) {
 		t.Fatal("expected oversize rejection")
 	}
 }
+
+func TestParseWeb2FieldsSanitizedAndCapped(t *testing.T) {
+	// web2_from/web2_to must survive Parse but be stripped of ALL control
+	// chars (CRLF header-injection defense) and length-capped.
+	body := `{"type":"notice","from":"` + sender + `","to":"` + recipient +
+		`","body":"x","ts":1,"web2_from":"attacker@evil.com\r\nBcc: victim@x.com","web2_to":"boss@corp.io"}`
+	p, err := Parse([]byte(body), sender, recipient)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if strings.ContainsAny(p.Web2From, "\r\n\t") {
+		t.Fatalf("web2_from not stripped of CRLF: %q", p.Web2From)
+	}
+	if p.Web2From != "attacker@evil.comBcc: victim@x.com" {
+		t.Fatalf("unexpected web2_from: %q", p.Web2From)
+	}
+	if p.Web2To != "boss@corp.io" {
+		t.Fatalf("unexpected web2_to: %q", p.Web2To)
+	}
+}
+
+func TestParseWeb2FieldsAbsentByDefault(t *testing.T) {
+	p, err := Parse([]byte(valid()), sender, recipient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Web2From != "" || p.Web2To != "" {
+		t.Fatalf("web2 fields must be empty for pure on-chain mail: %+v", p)
+	}
+}
