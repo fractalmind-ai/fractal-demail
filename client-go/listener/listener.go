@@ -282,7 +282,10 @@ func (l *Listener) process(ctx context.Context, ev *messageSentEvent) error {
 	var envBytes []byte
 	switch string(kind) {
 	case "inline":
-		envBytes = decodeInlinePayload(payload)
+		envBytes, err = decodeInlinePayload(payload)
+		if err != nil {
+			return err
+		}
 	case "walrus":
 		return fmt.Errorf("walrus payloads not supported yet")
 	default:
@@ -336,19 +339,22 @@ func (l *Listener) fetchPayload(ctx context.Context, messageID string) ([]byte, 
 }
 
 // decodeInlinePayload returns the envelope JSON bytes for an inline payload.
-// Canonical on-chain encoding (per docs/payload-envelope.md) is the base64
-// text of the envelope JSON — CLI-safe for PTB string arguments. Raw JSON
-// payloads (leading '{') are accepted for compatibility with early senders.
-func decodeInlinePayload(payload []byte) []byte {
+// Canonical on-chain encoding (docs/payload-envelope.md §0/§1) is the
+// pinned-variant base64 text of the envelope JSON — standard alphabet,
+// padded, no interior whitespace — CLI-safe for PTB string arguments. Raw
+// envelope JSON (leading '{', outside the base64 alphabet) is accepted for
+// compatibility with early senders. Leading/trailing ASCII whitespace is
+// stripped first (CLI tools append a newline); anything else non-conformant
+// is a poison message and is rejected with an error, never handed through.
+func decodeInlinePayload(payload []byte) ([]byte, error) {
 	if len(payload) > 0 && payload[0] == '{' {
-		return payload
+		return payload, nil
 	}
-	if decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(payload))); err == nil {
-		return decoded
+	decoded, err := envelope.DecodeBase64(strings.TrimSpace(string(payload)))
+	if err != nil {
+		return nil, fmt.Errorf("inline payload is neither raw envelope JSON nor pinned-variant base64: %w", err)
 	}
-	// Neither JSON nor base64: hand through and let envelope.Unmarshal
-	// produce the poison-message error.
-	return payload
+	return decoded, nil
 }
 
 // decodeVectorU8 accepts the two renderings Sui RPC uses for vector<u8>:

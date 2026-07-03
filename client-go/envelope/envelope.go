@@ -40,6 +40,28 @@ type Envelope struct {
 	CT    string `json:"ct"`
 }
 
+// DecodeBase64 decodes s enforcing the pinned base64 variant from
+// docs/payload-envelope.md §0: RFC 4648 §4 standard alphabet, '=' padding,
+// canonical trailing bits, no whitespace. Go's StdEncoding is looser than
+// the spec — it silently skips \r/\n and accepts non-canonical trailing
+// padding bits — so alphabet membership is checked explicitly and decoding
+// uses Strict mode.
+func DecodeBase64(s string) ([]byte, error) {
+	if s == "" || len(s)%4 != 0 {
+		return nil, fmt.Errorf("base64 length %d is not a positive multiple of 4", len(s))
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9',
+			c == '+', c == '/', c == '=':
+		default:
+			return nil, fmt.Errorf("byte %q at offset %d is outside the pinned base64 alphabet", c, i)
+		}
+	}
+	return base64.StdEncoding.Strict().DecodeString(s)
+}
+
 // Ed25519PublicToX25519 converts an Ed25519 public key to its X25519
 // counterpart (RFC 7748 birational map).
 func Ed25519PublicToX25519(pub ed25519.PublicKey) ([]byte, error) {
@@ -130,11 +152,14 @@ func Open(recipientEdPriv ed25519.PrivateKey, senderAddr, recipientAddr []byte, 
 	if env.Alg != Alg {
 		return nil, fmt.Errorf("unsupported envelope alg %q", env.Alg)
 	}
-	epk, err := base64.StdEncoding.DecodeString(env.EPK)
+	// Field encodings are validated against the pinned base64 variant
+	// (docs/payload-envelope.md §0) so an envelope has exactly one
+	// conformant text form — no re-encoding malleability.
+	epk, err := DecodeBase64(env.EPK)
 	if err != nil {
 		return nil, errors.New("invalid epk encoding")
 	}
-	nonce, err := base64.StdEncoding.DecodeString(env.Nonce)
+	nonce, err := DecodeBase64(env.Nonce)
 	if err != nil {
 		return nil, errors.New("invalid nonce encoding")
 	}
@@ -143,7 +168,7 @@ func Open(recipientEdPriv ed25519.PrivateKey, senderAddr, recipientAddr []byte, 
 	if len(nonce) != chacha20poly1305.NonceSizeX {
 		return nil, fmt.Errorf("invalid nonce length %d", len(nonce))
 	}
-	ct, err := base64.StdEncoding.DecodeString(env.CT)
+	ct, err := DecodeBase64(env.CT)
 	if err != nil {
 		return nil, errors.New("invalid ct encoding")
 	}

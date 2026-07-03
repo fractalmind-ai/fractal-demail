@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -507,6 +508,99 @@ func TestPollOnceAcceptsBase64TextInlinePayload(t *testing.T) {
 	}
 	if got != "cli-sender-payload" {
 		t.Fatalf("base64-text inline payload not delivered, got %q", got)
+	}
+}
+
+func TestPollOnceAcceptsInlinePayloadWithTrailingNewline(t *testing.T) {
+	// CLI tools (base64(1), shell heredocs) append a trailing newline to the
+	// payload text; the spec allows decoders to strip surrounding whitespace.
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envB64Text := sealedPayload(t, pub, "cli-newline")
+	doubleEncoded := base64.StdEncoding.EncodeToString([]byte(envB64Text + "\n"))
+	srv := mockRPC(t, doubleEncoded)
+	defer srv.Close()
+
+	got := ""
+	l, err := New(Config{
+		RPCURL:      srv.URL,
+		PackageID:   packageID,
+		Recipient:   recipientAddr,
+		IdentityKey: priv,
+	}, func(_ string, msg *schema.Plaintext) { got = msg.Body })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.PollOnce(context.Background()); err != nil {
+		t.Fatalf("PollOnce: %v", err)
+	}
+	if got != "cli-newline" {
+		t.Fatalf("trailing-newline payload not delivered, got %q", got)
+	}
+}
+
+func TestPollOnceRejectsNonPinnedBase64InlineAsPoison(t *testing.T) {
+	// Inline payloads in a non-pinned base64 variant (docs/payload-envelope.md
+	// §0) are poison: dropped without delivery, without stalling the stream,
+	// and with the cursor advanced past them.
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envB64Text := sealedPayload(t, pub, "variant-probe")
+
+	variants := map[string]string{
+		"url-safe alphabet": strings.NewReplacer("+", "-", "/", "_").Replace(envB64Text),
+		"unpadded":          strings.TrimRight(envB64Text, "="),
+		"interior crlf":     envB64Text[:8] + "\r\n" + envB64Text[8:],
+		"interior lf":       envB64Text[:8] + "\n" + envB64Text[8:],
+		"garbage":           "not base64 at all!",
+	}
+	for name, payloadText := range variants {
+		if payloadText == envB64Text {
+			continue // mutation happened to be a no-op this run
+		}
+		t.Run(name, func(t *testing.T) {
+			srv := mockRPC(t, base64.StdEncoding.EncodeToString([]byte(payloadText)))
+			defer srv.Close()
+
+			called := false
+			l, err := New(Config{
+				RPCURL:      srv.URL,
+				PackageID:   packageID,
+				Recipient:   recipientAddr,
+				IdentityKey: priv,
+			}, func(string, *schema.Plaintext) { called = true })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := l.PollOnce(context.Background()); err != nil {
+				t.Fatalf("poison must not fail the poll: %v", err)
+			}
+			if called {
+				t.Fatal("handler must not receive non-pinned-variant payloads")
+			}
+			if l.cursor == nil {
+				t.Fatal("cursor must advance past poison messages")
+			}
+		})
+	}
+}
+
+func TestDecodeInlinePayload(t *testing.T) {
+	rawJSON := []byte(`{"v":1}`)
+	if got, err := decodeInlinePayload(rawJSON); err != nil || string(got) != `{"v":1}` {
+		t.Fatalf("raw JSON compat path: got %q, %v", got, err)
+	}
+	if got, err := decodeInlinePayload([]byte("aGVsbG8=\n")); err != nil || string(got) != "hello" {
+		t.Fatalf("canonical base64 with trailing newline: got %q, %v", got, err)
+	}
+	for _, bad := range []string{"aGVsbG8", "aGVs\nbG8=", "aGVsbG8_", "ZE=="} {
+		if _, err := decodeInlinePayload([]byte(bad)); err == nil {
+			t.Errorf("non-pinned payload %q must be rejected", bad)
+		}
 	}
 }
 
