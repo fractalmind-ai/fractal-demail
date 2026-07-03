@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 // Allowlist is a case-insensitive set of permitted email addresses.
@@ -64,7 +65,9 @@ func normalizeEmail(s string) string {
 	return s
 }
 
-func isControl(r rune) bool { return r < 0x20 || r == 0x7f }
+// isControl covers C0, DEL, and the C1 range so no control rune can be
+// trimmed into a valid-looking address.
+func isControl(r rune) bool { return unicode.IsControl(r) }
 
 // RateLimiter is a token-bucket limiter with a global bucket and per-key
 // buckets (key = sender email). It defends against a compromised allowlisted

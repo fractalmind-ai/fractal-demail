@@ -128,8 +128,13 @@ func stripEmailControl(s string) string {
 }
 
 func capString(s string, max int) string {
-	if len(s) > max {
-		return s[:max]
+	if len(s) <= max {
+		return s
 	}
-	return s
+	// Cap by bytes but never split a multibyte rune.
+	r := []rune(s)
+	for len(string(r)) > max {
+		r = r[:len(r)-1]
+	}
+	return string(r)
 }
