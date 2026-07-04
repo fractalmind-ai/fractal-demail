@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -108,7 +109,19 @@ func (cfg *RelayerConfig) BuildServer(webhookSecret string) (*WebhookServer, err
 		if err != nil {
 			return nil, fmt.Errorf("org %q relayer: %w", o.Domain, err)
 		}
-		orgs[o.Domain] = relayer
+		// Normalize + dedup the domain key here, matching MultiOrgRelayer's
+		// normalization. Otherwise two array entries with the same domain
+		// would silently collapse in this map (last-wins) before the router's
+		// duplicate guard could reject them — a fat-fingered duplicate tenant
+		// domain must fail loudly, not route a domain to the wrong org.
+		domain := emailDomain("x@" + strings.TrimSpace(o.Domain))
+		if domain == "" {
+			return nil, fmt.Errorf("org has invalid domain %q", o.Domain)
+		}
+		if _, dup := orgs[domain]; dup {
+			return nil, fmt.Errorf("org domain %q duplicated in config", domain)
+		}
+		orgs[domain] = relayer
 	}
 	multi, err := NewMultiOrgRelayer(verifier, orgs)
 	if err != nil {

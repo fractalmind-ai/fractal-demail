@@ -90,3 +90,20 @@ func TestLoadRejectsMissingFile(t *testing.T) {
 		t.Fatal("missing file must error")
 	}
 }
+
+func TestBuildRejectsDuplicateOrgDomains(t *testing.T) {
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	pk := base64.StdEncoding.EncodeToString(pub)
+	org := `{
+	  "domain": "algonius.ai",
+	  "bridgeAddress": "0xeedfe046af0c10613356dea725fbe22af969a58077f27622936a6c4d9ec2fce3",
+	  "gasCoin": "0xaefda11d73d84d396efc835f68f4d0b243109c3ceede1f64528f1358a9cac902",
+	  "allowedSenders": ["owner@gmail.com"],
+	  "agents": [{"localpart":"agent","suiAddress":"0xf4fafecc95c2e7c984f8d26db9b692cf58da977ee0119be38b84904b394e82e2","pubKey":"` + pk + `"}]
+	}`
+	body := `{"packageId":"0x65c96400535e97f9a5c444c284dfb531590f2119f5de4a1253f15f1a99b72e82","orgs":[` + org + `,` + org + `]}`
+	cfg, _ := LoadRelayerConfig(writeCfg(t, body))
+	if _, err := cfg.BuildServer(cfgSecret); err == nil {
+		t.Fatal("duplicate org domains must be rejected, not silently collapsed")
+	}
+}
