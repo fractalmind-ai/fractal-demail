@@ -1,0 +1,21 @@
+{
+  "bind": ":8080",
+  "maxBodyBytes": 1048576,
+  "packageId": "0x65c96400535e97f9a5c444c284dfb531590f2119f5de4a1253f15f1a99b72e82",
+  "orgs": [
+    {
+      "domain": "algonius.ai",
+      "bridgeAddress": "0xBRIDGE_SUI_ADDRESS",
+      "sponsorAddress": "0xSPONSOR_ADDRESS_OR_OMIT_FOR_SELF_SPONSORED",
+      "gasCoin": "0xSPONSOR_OWNED_GAS_COIN_OBJECT_ID",
+      "allowedSenders": ["owner@gmail.com"],
+      "perSenderPerHour": 20,
+      "perSenderBurst": 5,
+      "globalPerHour": 200,
+      "globalBurst": 50,
+      "agents": [
+        { "localpart": "agent", "suiAddress": "0xAGENT_SUI_ADDRESS", "pubKey": "BASE64_ED25519_PUBKEY" }
+      ]
+    }
+  ]
+}
